@@ -1,7 +1,7 @@
 {
-  "ingress_base_url": "https://konan.summitless.io",
+  "ingress_base_url": "http://konan.summitless.io",
   "oidc": {
-    "realm": "prod",
+    "realm": "dev",
     "client_id": "qt-win"
   },
   "plugins": [

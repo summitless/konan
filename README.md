@@ -30,7 +30,7 @@ series) yourself from [qt.io](https://www.qt.io/download-qt-installer).
 - `android/` — arm64-v8a, armeabi-v7a
 - `ios/` — arm64
 - `macos/` — arm64, x86_64
-- `windows/` — x86_64, arm64
+- `windows/` — arm64, x86_64
 
 ## Prerequisites
 
@@ -235,7 +235,7 @@ Qt 自身不在这个仓库里 —— 你要自己去 [qt.io](https://www.qt.io/
 - `android/` — arm64-v8a, armeabi-v7a
 - `ios/` — arm64
 - `macos/` — arm64, x86_64
-- `windows/` — x86_64, arm64
+- `windows/` — arm64, x86_64
 
 ## 准备工作
 

@@ -84,24 +84,51 @@ jobs:
           echo "tag=v$VER"   >> "$GITHUB_OUTPUT"
           echo "Konan version: $VER"
 
-      - name: 决定是否需要重建 (基于 git hash)
+      - name: 决定是否需要重建 (基于源码内容 hash, 排除 CI/工作流改动)
         id: cache_check
         run: |
           set -e
           cd "$KONAN_SOURCE"
-          CUR=$(git rev-parse --short=8 HEAD)
-          echo "hash=$CUR" >> "$GITHUB_OUTPUT"
+          # HEAD short hash 只用于 release asset 命名 (用户能 git checkout
+          # 到这个 commit), 不参与 cache 判断。
+          HEAD_HASH=$(git rev-parse --short=8 HEAD)
+          echo "hash=$HEAD_HASH" >> "$GITHUB_OUTPUT"
+
+          # SRC_HASH = 影响构建产物的文件集合的内容 hash。
+          # 计算方式: 对每个路径取 git rev-parse HEAD:<path> (目录 → tree
+          # hash, 文件 → blob hash), 串起来 sha256 再截前 8 位。任一文件
+          # 内容变 → 它的 hash 变 → 总 hash 变。
+          # 列表里只放真正影响二进制的:src/ 整棵, 顶层 CMakeLists, pixi
+          # env, build/dev/lgpl-生成脚本。**不放** workflow yaml /
+          # release_dispatch.py / .claude/ / docs/ / lgpl_dist/.github/
+          # 这些纯 CI/工具改动不该让 cache 失效。
+          SRC_HASH=$(
+            {
+              git rev-parse HEAD:src
+              git rev-parse HEAD:CMakeLists.txt
+              git rev-parse HEAD:pixi.toml.in
+              git rev-parse HEAD:scripts/build.py
+              git rev-parse HEAD:scripts/dev_mac.py
+              git rev-parse HEAD:scripts/dev_ios.py
+              git rev-parse HEAD:scripts/dev_android.py
+              git rev-parse HEAD:scripts/dev_windows.py
+              git rev-parse HEAD:scripts/generate_lgpl.py
+            } 2>/dev/null | shasum -a 256 | cut -c1-8
+          )
+          echo "src_hash=$SRC_HASH" >> "$GITHUB_OUTPUT"
+
           MARKER="lgpl_dist/relink/.built-from-hash"
-          # 只有 marker 命中, 且 4 个平台 relink 输出都齐, 才跳过 build/relink。
-          # 缺一个平台 (e.g. windows 上次失败) 就重做整套。
-          if [ -f "$MARKER" ] && [ "$(cat $MARKER)" = "$CUR" ] \
+          # 只有 marker 命中 (跟 SRC_HASH 一致), 且 4 个平台 relink 输出
+          # 都齐, 才跳过 build/relink。缺一个 (e.g. windows 上次失败) 就
+          # 重做整套。
+          if [ -f "$MARKER" ] && [ "$(cat $MARKER)" = "$SRC_HASH" ] \
              && [ -d lgpl_dist/relink/macos ]   && [ -d lgpl_dist/relink/ios ] \
              && [ -d lgpl_dist/relink/android ] && [ -d lgpl_dist/relink/windows ]; then
             echo "skip_build=true" >> "$GITHUB_OUTPUT"
-            echo "git hash $CUR 已有 relink 结果, 跳过 build/relink, 直接打包发布"
+            echo "src hash $SRC_HASH 命中, 跳过 build/relink, 直接打包发布 (HEAD=$HEAD_HASH)"
           else
             echo "skip_build=false" >> "$GITHUB_OUTPUT"
-            echo "git hash $CUR 无对应 relink 结果, 走完整 build → relink"
+            echo "src hash $SRC_HASH 无对应 relink 结果, 走完整 build → relink (HEAD=$HEAD_HASH)"
           fi
 
       - name: 构建 macOS (arm64 + x86_64)
@@ -170,7 +197,9 @@ jobs:
           done
 
       - name: 生成 lgpl_dist (含 VERSION 文件)
-        if: steps.cache_check.outputs.skip_build != 'true'
+        # 不 gate 在 skip_build —— 即便源码 hash 没变, 工作流 yaml / 文档 /
+        # lgpl 分支模板等也可能更新, 总是重新生成 lgpl_dist 让它跟 Private
+        # 当前工作树一致 (pixi run lgpl 是从 build/ 增量同步, 没改动时也很快)。
         run: |
           cd "$KONAN_SOURCE"
           pixi run lgpl
@@ -181,7 +210,72 @@ jobs:
             exit 1
           fi
 
+      - name: 推送 lgpl 分支 (lgpl_dist 内容 → summitless/lgpl, 1 版本 1 commit)
+        # 不 gate 在 skip_build —— 即便 src 没变, 也要把 lgpl_dist (含工作流
+        # yaml / README / NOTICE 等) 同步上去。push 步骤本身有 diff 检查,
+        # 没变化时 commit 阶段会自动跳过。
+        #
+        # 流程: 用 git worktree 在 /tmp/konan-lgpl-wt 取 summitless/lgpl 当前
+        # 内容 → 清空 → 用 lgpl_dist 覆盖 → add/commit/push。relink/ 由
+        # lgpl_dist/.gitignore 排除, 不会进 lgpl 分支。
+        #
+        # 同版本 amend + force-with-lease, 跨版本新建 commit
+        # (memory feedback_lgpl_one_commit_per_version: 1 版本 1 commit)。
+        id: lgpl_push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd "$KONAN_SOURCE"
+          git fetch summitless lgpl
+          LGPL_WT=/tmp/konan-lgpl-wt
+          if [ -d "$LGPL_WT" ]; then
+            # 清掉旧 worktree (上一次 run 可能没善后)
+            git worktree remove --force "$LGPL_WT" 2>/dev/null || rm -rf "$LGPL_WT"
+          fi
+          git worktree add -B lgpl "$LGPL_WT" summitless/lgpl
+
+          # 用 lgpl_dist 覆盖 worktree。先清掉除 .git 外的所有文件 / 目录,
+          # 再 rsync; 这样老版本里有但新版本没有的文件能被删掉。
+          cd "$LGPL_WT"
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          rsync -a \
+            --exclude='relink/' \
+            --exclude='.pixi/' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='.DS_Store' \
+            "$KONAN_SOURCE/lgpl_dist/" .
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          VER="${{ steps.version.outputs.version }}"
+          HEAD_MSG=$(git log -1 --format=%s 2>/dev/null || echo "")
+          if git diff --cached --quiet; then
+            echo "lgpl_dist 与 lgpl 分支当前 HEAD 一致, 跳过 commit/push"
+          elif [ "$HEAD_MSG" = "Konan v$VER" ]; then
+            git commit --amend -m "Konan v$VER" --reset-author
+            git push summitless lgpl --force-with-lease
+            echo "已 amend Konan v$VER 并 force-with-lease 推送 (同版本 squash)"
+          else
+            git commit -m "Konan v$VER"
+            git push summitless lgpl
+            echo "已新建 Konan v$VER 推送到 summitless/lgpl"
+          fi
+
+          # 给后续步骤参考新 lgpl 分支 HEAD
+          NEW_LGPL_SHA=$(git rev-parse HEAD)
+          echo "lgpl_sha=$NEW_LGPL_SHA" >> "$GITHUB_OUTPUT"
+          echo "lgpl_wt=$LGPL_WT"       >> "$GITHUB_OUTPUT"
+
       - name: relink 各平台/架构 → 可分发产物
+        # 物理上在 $KONAN_SOURCE/lgpl_dist/ 跑 relink (避开 win11 端路径切换 +
+        # 多 worktree pixi env 安装), 但前一步"推送 lgpl 分支"已经把 lgpl_dist
+        # 推上去了 → 这时候 lgpl_dist 内容 == summitless/lgpl 当前 HEAD 内容,
+        # 在这里 relink 等价于在 lgpl 分支 checkout 上 relink, 后续 package
+        # 出来的 tarball 也就反映的是 lgpl 分支的最新内容。
         if: steps.cache_check.outputs.skip_build != 'true'
         run: |
           set -e
@@ -204,12 +298,14 @@ jobs:
             "${WIN11_SSH}:~/source/repos/qt6-solution/lgpl_dist/relink/windows/" \
             "$KONAN_SOURCE/lgpl_dist/relink/windows/"
 
-      - name: 标记 relink 对应的 git hash (下次同 hash 触发可跳过 build)
+      - name: 标记 relink 对应的源码 hash (下次同源码可跳过 build)
         if: steps.cache_check.outputs.skip_build != 'true'
         run: |
-          cd "$KONAN_SOURCE"
-          git rev-parse --short=8 HEAD > lgpl_dist/relink/.built-from-hash
-          echo "marker: $(cat lgpl_dist/relink/.built-from-hash)"
+          # 写 src_hash 而不是 HEAD hash: 后续仅 CI/workflow 改动 (HEAD 变
+          # src 不变) 会命中 cache, 真源码改动 (HEAD 变 src 也变) 才重编。
+          echo "${{ steps.cache_check.outputs.src_hash }}" \
+            > "$KONAN_SOURCE/lgpl_dist/relink/.built-from-hash"
+          echo "marker: $(cat $KONAN_SOURCE/lgpl_dist/relink/.built-from-hash)"
 
       - name: 打包 release assets
         run: |
@@ -247,6 +343,42 @@ jobs:
       - name: 生成 SHA256 sidecar + SHA256SUMS
         run: python3 "$KONAN_SOURCE/scripts/release_sha256.py" "$ASSETS_DIR"
 
+      - name: 生成中英双语 release notes
+        # 取上一次 GitHub release 的 published_at 时间戳, 把 Private 分支自此
+        # 之后的所有 commit 喂给 release_notes.py 自动分类成 features/fixes/
+        # other, 过滤掉 CI/工具琐碎提交。qt6-solution Private 分支不打 v* tag
+        # (tag 只在 summitless/konan 上由 gh release 创建), 所以用时间戳切片。
+        id: notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.version.outputs.tag }}"
+          # 拿最近 2 个 release; 跳过同名 (重发场景), 取真正的"上一个"
+          PREV_DATE=$(gh api 'repos/summitless/konan/releases?per_page=10' \
+            --jq ".[] | select(.tag_name != \"$TAG\") | .published_at" \
+            | head -1)
+          # 注意: notes 不放在 $ASSETS_DIR 里, 否则下一步的
+          # `$ASSETS_DIR/*` glob 会把 notes 也作为 release asset 上传。
+          NOTES_FILE="/tmp/konan-release-notes.md"
+          if [ -n "$PREV_DATE" ]; then
+            echo "上次 release published_at = $PREV_DATE"
+            python3 "$KONAN_SOURCE/scripts/release_notes.py" \
+              "${{ steps.version.outputs.version }}" \
+              --since "$PREV_DATE" \
+              --repo "$KONAN_SOURCE" \
+              > "$NOTES_FILE"
+          else
+            echo "无上一次 release, 走 tag 回退/首发分支"
+            python3 "$KONAN_SOURCE/scripts/release_notes.py" \
+              "${{ steps.version.outputs.version }}" \
+              --repo "$KONAN_SOURCE" \
+              > "$NOTES_FILE"
+          fi
+          echo "---- generated notes ----"
+          cat "$NOTES_FILE"
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
       - name: 创建 GitHub release
         if: ${{ !inputs.dry_run }}
         env:
@@ -259,11 +391,13 @@ jobs:
             gh release delete "$TAG" --repo summitless/konan --yes --cleanup-tag
           fi
           # target_commitish=lgpl: release 关联到 lgpl 分支顶部 commit
+          # (此时 lgpl HEAD = "Konan v$VER", 由前面的 lgpl push 步骤创建)
+          # --notes-file 用 release_notes.py 生成的中英双语 markdown
           gh release create "$TAG" \
             --repo summitless/konan \
             --target lgpl \
             --title "Konan $TAG" \
-            --notes "Konan $TAG. 详细安装/relink 说明见 [lgpl 分支 README](https://github.com/summitless/konan/tree/lgpl#readme)。每个 asset 旁有 \`<asset>.sha256\` sidecar, 也有总 \`SHA256SUMS\`。" \
+            --notes-file "${{ steps.notes.outputs.notes_file }}" \
             "$ASSETS_DIR"/*
 
       - name: Summary
