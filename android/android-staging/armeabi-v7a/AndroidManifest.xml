@@ -1,0 +1,118 @@
+<?xml version="1.0"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.hbb.konan"
+    android:installLocation="auto"
+    android:versionCode="-- %%INSERT_VERSION_CODE%% --"
+    android:versionName="-- %%INSERT_VERSION_NAME%% --">
+    <!-- %%INSERT_PERMISSIONS -->
+    <!-- %%INSERT_FEATURES -->
+
+    <!--
+        前台服务保活:把 Konan 切到后台后,Android 在内存压力下会回收进程,
+        DirectorySyncEngine 跟着死,别的设备推过来的 .clipboard/.favorites
+        变化全部丢。开一个 dataSync 类型的前台服务把进程顶住,引擎和
+        ClipboardSyncService::applyPendingReceive 才能在后台继续跑。
+
+        - FOREGROUND_SERVICE:声明本应用使用前台服务(Android 9+ 必需)
+        - FOREGROUND_SERVICE_DATA_SYNC:Android 14+ 必须显式声明 fgs 用途
+        - POST_NOTIFICATIONS:Android 13+ 弹通知必须运行时申请
+        - WAKE_LOCK:DirectorySyncEngine 在 Doze 间隙的轮询不被 CPU 休眠掐断
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <supports-screens
+        android:anyDensity="true"
+        android:largeScreens="true"
+        android:normalScreens="true"
+        android:smallScreens="true" />
+    <application
+        android:name="org.qtproject.qt.android.bindings.QtApplication"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="-- %%INSERT_APP_NAME%% --"
+        android:requestLegacyExternalStorage="true"
+        android:allowBackup="true"
+        android:fullBackupOnly="false">
+        <activity
+            android:name="com.hbb.konan.KonanQtActivity"
+            android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density"
+            android:launchMode="singleTask"
+            android:screenOrientation="unspecified"
+            android:exported="true">
+            <!--
+                launchMode=singleTask 而不是 singleTop:Pixel Photos 的"分享给
+                Konan"intent 带 FLAG_ACTIVITY_MULTIPLE_TASK + FLAG_ACTIVITY_NEW_TASK,
+                singleTop 下 Android 会强制开新 task / 新 Activity 实例,走
+                onCreate;同进程里 Qt 在 onCreate 检测到 isStarted=true 直接调
+                QtActivityBase.restartApplication() 自杀重启(makeRestartActivityTask
+                → MAIN+LAUNCHER → Runtime.exit(0))→ SEND payload 跟 URI 权限
+                一并丢失 → 表现就是"分享图片必须先强制停止才能成功"。
+                singleTask 强制全局单例,MULTIPLE_TASK 请求被 Android 忽略,
+                SEND 直接走 onNewIntent(KonanQtActivity 已 override + setIntent
+                + nativeOnNewIntent),自杀路径不再被触发。
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Receive a single shared item (file, image, text, …) from
+                 another app. ShareReceiverAndroid.cpp reads this intent
+                 on activity resume and imports into the clipboard store. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <!-- Multi-item share; each EXTRA_STREAM URI is imported in turn. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+          <meta-data
+                android:name="android.app.lib_name"
+                android:value="-- %%INSERT_APP_LIB_NAME%% --" />
+
+          <meta-data
+                android:name="android.app.arguments"
+                android:value="-- %%INSERT_APP_ARGUMENTS%% --" />
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.qtprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/qtprovider_paths"/>
+        </provider>
+
+        <!--
+            进程保活前台服务(KonanForegroundService.java)。
+            foregroundServiceType=dataSync:Android 14+ 必须申明,否则
+            startForeground 抛 ForegroundServiceTypeNotAllowedException。
+            和 Activity 同进程跑,只为顶住进程不被回收;真正的同步引擎仍然
+            在 Qt 主线程。
+
+            **stopWithTask=true**:用户从最近任务划掉 Konan 时,FG service
+            跟着任务一起停。这是必要的 —— 否则 service 留着、进程没死、
+            Qt 内部 isStarted=true,用户重开 Konan 时 QtActivityBase.onCreate
+            走 restartApplication() 自杀重启路径,跟 FG service 的 START_STICKY
+            重启路径在同一进程里抢资源,表现就是"重新打开卡着不动"。
+            真正需要后台保活的场景是 Home 键 / 切到其它 App(那时任务还在,
+            stopWithTask 不触发,service 照常跑后台同步);划掉是用户明确表
+            达"我要彻底关掉",service 跟着停符合心智模型也消除死锁。
+        -->
+        <service
+            android:name="com.hbb.konan.KonanForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false"
+            android:stopWithTask="true"/>
+    </application>
+</manifest>

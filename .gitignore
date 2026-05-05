@@ -1,0 +1,10 @@
+# pixi run relink 的产出 — 不 commit 进 lgpl 分支.
+# 用户每次 relink 都会重新生成这些, 走 user 自己的 Qt.
+relink/
+
+# 通用噪音
+.pixi/
+__pycache__/
+*.pyc
+.DS_Store
+*.sw?

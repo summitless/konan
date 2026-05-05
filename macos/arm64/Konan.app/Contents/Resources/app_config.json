@@ -1,0 +1,13 @@
+{
+  "ingress_base_url": "https://konan.summitless.io",
+  "oidc": {
+    "realm": "prod",
+    "client_id": "qt-mac"
+  },
+  "plugins": [
+    {"library": "hotreload_plugin"},
+    {"library": "dashboard_plugin"},
+    {"library": "qml_controls_plugin"},
+    {"library": "ffi_example_plugin", "loader": "ffi"}
+  ]
+}

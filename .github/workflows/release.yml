@@ -1,0 +1,275 @@
+# Release Konan
+#
+# 触发: workflow_dispatch (手动触发)。
+# Runner: 单台 macOS self-hosted runner (label: self-hosted, macOS)。
+#         Windows 构建/relink 通过 ssh 到 PD Win11 VM (alias: win11) 完成。
+# Author 显示: github-actions[bot] (用内置 GITHUB_TOKEN, 不暴露真人账号)。
+#
+# 本文件源文件位于 Private 分支的 lgpl_dist/.github/workflows/release.yml,
+# pixi run lgpl 后由 generate_lgpl.py 留在 lgpl_dist/, 用户把 lgpl_dist/
+# 内容刷到 lgpl 分支根, 这个 yml 就出现在 summitless/konan 默认分支的
+# .github/workflows/, GitHub UI 才能看到+触发。
+#
+# 触发前置 (release skill 会逐项检查):
+#   1. PD Win11 VM 启动, ssh win11 通
+#   2. 本机 Clash 代理开启 (github push/release 走代理)
+#   3. ssh 47 通 (forgejo origin 通过 LocalForward 2222 走它)
+#   4. qt6-solution + 子模块工作树全部干净, Private 分支
+#   5. 本机 Qt 装在 ~/Qt/6.8.3, Win11 Qt 装在 C:/Qt/6.8.3 (可在下面改)
+
+name: Release Konan
+
+on:
+  workflow_dispatch:
+    inputs:
+      ingress_host:
+        description: "Ingress base URL (烘进 app_config.json)"
+        required: true
+        default: "https://konan.summitless.io"
+      auth_realm:
+        description: "Keycloak realm (烘进 app_config.json)"
+        required: true
+        default: "prod"
+      dry_run:
+        description: "只构建+打包, 跳过 gh release create"
+        type: boolean
+        default: false
+
+# GITHUB_TOKEN 默认 read-only (org default), 需要显式给 contents:write 才能
+# 删/建 release; releases:write 是新写法,部分场景 contents:write 不够。
+permissions:
+  contents: write
+
+env:
+  # 单 macOS runner 上 Private 分支的 checkout 绝对路径。
+  # 不用 actions/checkout — 我们要的是已经 sync 好的 Private 分支工作树
+  # (含子模块 + 本地未 push 的 commit), 不是 lgpl 分支的快照。
+  KONAN_SOURCE: /Users/hbb/source/repos/qt6-solution
+  WIN11_SSH: win11
+  QT_DIR_MAC: /Users/hbb/Qt/6.8.3
+  QT_DIR_WIN: 'C:/Qt/6.8.3'
+  ASSETS_DIR: /tmp/konan-release-assets
+
+jobs:
+  release:
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: 校验源码工作树干净 + 在 Private 分支
+        run: |
+          set -e
+          cd "$KONAN_SOURCE"
+          BR=$(git branch --show-current)
+          if [ "$BR" != "Private" ]; then
+            echo "expected branch=Private, got=$BR"; exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "qt6-solution 工作树脏:"
+            git status --short
+            exit 1
+          fi
+          # 子模块也得干净 (顶层 status 只看到 -dirty 标记不够直观)
+          git submodule foreach --recursive '
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "子模块 $name 脏:"; git status --short; exit 1
+            fi
+          '
+
+      - name: 读取版本号
+        id: version
+        run: |
+          # 顶层 CMakeLists.txt 的 project(... VERSION X.Y.Z) 是真相源
+          VER=$(awk -F'VERSION ' '/^project\(/ { gsub(/[^0-9.].*/, "", $2); print $2; exit }' "$KONAN_SOURCE/CMakeLists.txt")
+          if [ -z "$VER" ]; then echo "未能从 CMakeLists.txt 解析版本"; exit 1; fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER"   >> "$GITHUB_OUTPUT"
+          echo "Konan version: $VER"
+
+      - name: 决定是否需要重建 (基于 git hash)
+        id: cache_check
+        run: |
+          set -e
+          cd "$KONAN_SOURCE"
+          CUR=$(git rev-parse --short=8 HEAD)
+          echo "hash=$CUR" >> "$GITHUB_OUTPUT"
+          MARKER="lgpl_dist/relink/.built-from-hash"
+          # 只有 marker 命中, 且 4 个平台 relink 输出都齐, 才跳过 build/relink。
+          # 缺一个平台 (e.g. windows 上次失败) 就重做整套。
+          if [ -f "$MARKER" ] && [ "$(cat $MARKER)" = "$CUR" ] \
+             && [ -d lgpl_dist/relink/macos ]   && [ -d lgpl_dist/relink/ios ] \
+             && [ -d lgpl_dist/relink/android ] && [ -d lgpl_dist/relink/windows ]; then
+            echo "skip_build=true" >> "$GITHUB_OUTPUT"
+            echo "git hash $CUR 已有 relink 结果, 跳过 build/relink, 直接打包发布"
+          else
+            echo "skip_build=false" >> "$GITHUB_OUTPUT"
+            echo "git hash $CUR 无对应 relink 结果, 走完整 build → relink"
+          fi
+
+      - name: 构建 macOS (arm64 + x86_64)
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          set -e
+          cd "$KONAN_SOURCE"
+          for ARCH in arm64 x86_64; do
+            python3 scripts/build.py --release --no-hotreload --arch "$ARCH" \
+              --ingress-host "${{ inputs.ingress_host }}" \
+              --realm "${{ inputs.auth_realm }}" \
+              --bundle
+          done
+
+      - name: 构建 iOS (arm64, device)
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          set -e
+          cd "$KONAN_SOURCE"
+          python3 scripts/build.py --release --no-hotreload --ios --arch arm64 \
+            --ingress-host "${{ inputs.ingress_host }}" \
+            --realm "${{ inputs.auth_realm }}"
+
+      - name: 构建 Android (arm64-v8a + armeabi-v7a)
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          set -e
+          cd "$KONAN_SOURCE"
+          for ABI in arm64-v8a armeabi-v7a; do
+            python3 scripts/build.py --release --no-hotreload --android --arch "$ABI" \
+              --ingress-host "${{ inputs.ingress_host }}" \
+              --realm "${{ inputs.auth_realm }}"
+          done
+
+      - name: 同步源码到 Win11 (rsync over ssh)
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          set -e
+          cd "$KONAN_SOURCE"
+          # 一次性 push, 不 watch。--gitignore 跳过 build/ .pixi/ 等; --git
+          # 带 .git/ 让 win11 端也能跑 git 命令(submodule 状态 / hash 注入)。
+          python3 scripts/sync.py "${WIN11_SSH}:~/source/repos/qt6-solution/" --gitignore --git
+
+      - name: 在 Win11 上构建 Windows (x86_64 + arm64)
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          set -e
+          # dev_windows.py 不接受 --no-hotreload (release 默认就关 hotreload)
+          # 但要 --no-launch, 避免 build 完自动启 exe
+          for ARCH in x86_64 arm64; do
+            ssh "$WIN11_SSH" "cd ~/source/repos/qt6-solution && \
+              pixi run windows -- --release --no-launch --arch $ARCH \
+              --ingress-host '${{ inputs.ingress_host }}' \
+              --realm '${{ inputs.auth_realm }}'"
+          done
+
+      - name: 拉回 Win11 build/ 产出
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          set -e
+          for ARCH in x86_64 arm64; do
+            mkdir -p "$KONAN_SOURCE/build/win-${ARCH}-release"
+            rsync -a --delete \
+              "${WIN11_SSH}:~/source/repos/qt6-solution/build/win-${ARCH}-release/" \
+              "$KONAN_SOURCE/build/win-${ARCH}-release/"
+          done
+
+      - name: 生成 lgpl_dist (含 VERSION 文件)
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          cd "$KONAN_SOURCE"
+          pixi run lgpl
+          # 校验 VERSION 跟 CMakeLists 一致
+          DIST_VER=$(cat lgpl_dist/VERSION)
+          if [ "$DIST_VER" != "${{ steps.version.outputs.version }}" ]; then
+            echo "lgpl_dist/VERSION ($DIST_VER) != CMake project version (${{ steps.version.outputs.version }})"
+            exit 1
+          fi
+
+      - name: relink 各平台/架构 → 可分发产物
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          set -e
+          cd "$KONAN_SOURCE/lgpl_dist"
+          pixi run relink macos   --arch arm64        --qt-dir "$QT_DIR_MAC"
+          pixi run relink macos   --arch x86_64       --qt-dir "$QT_DIR_MAC"
+          pixi run relink ios     --arch arm64        --qt-dir "$QT_DIR_MAC"
+          pixi run relink android --arch arm64-v8a    --qt-dir "$QT_DIR_MAC"
+          pixi run relink android --arch armeabi-v7a  --qt-dir "$QT_DIR_MAC"
+          # Windows relink 在 win11 上跑 (x64/arm64 各自的 Qt + MSVC)
+          # 先把 lgpl_dist (含刚生成的 windows/<arch>) sync 到 win11 让它有最新 staging
+          cd "$KONAN_SOURCE"
+          python3 scripts/sync.py "${WIN11_SSH}:~/source/repos/qt6-solution/" --gitignore --git
+          ssh "$WIN11_SSH" "cd ~/source/repos/qt6-solution/lgpl_dist && \
+            pixi run relink windows --arch x86_64 --qt-dir '$QT_DIR_WIN' && \
+            pixi run relink windows --arch arm64  --qt-dir '$QT_DIR_WIN'"
+          # 拉回 win11 的 relink 产出
+          mkdir -p "$KONAN_SOURCE/lgpl_dist/relink/windows"
+          rsync -a --delete \
+            "${WIN11_SSH}:~/source/repos/qt6-solution/lgpl_dist/relink/windows/" \
+            "$KONAN_SOURCE/lgpl_dist/relink/windows/"
+
+      - name: 标记 relink 对应的 git hash (下次同 hash 触发可跳过 build)
+        if: steps.cache_check.outputs.skip_build != 'true'
+        run: |
+          cd "$KONAN_SOURCE"
+          git rev-parse --short=8 HEAD > lgpl_dist/relink/.built-from-hash
+          echo "marker: $(cat lgpl_dist/relink/.built-from-hash)"
+
+      - name: 打包 release assets
+        run: |
+          set -e
+          DIST="$ASSETS_DIR"
+          rm -rf "$DIST"; mkdir -p "$DIST"
+          VER="${{ steps.version.outputs.version }}"
+          # 8 字符 git hash 作为包名后缀, 同 release 不同 build 之间也能区分
+          # (e.g. workflow YAML 改了 → hash 变 → 重出包但 VERSION 不变)
+          HASH="${{ steps.cache_check.outputs.hash }}"
+          cd "$KONAN_SOURCE/lgpl_dist/relink"
+          # macOS: ditto-zip 保留扩展属性 + 签名结构
+          for ARCH in arm64 x86_64; do
+            ditto -c -k --keepParent "macos/$ARCH/Konan.app" "$DIST/Konan-$VER-macos-$ARCH-$HASH.zip"
+          done
+          # Windows: zip bin/ 目录
+          for ARCH in x86_64 arm64; do
+            ( cd "windows/$ARCH" && zip -qr "$DIST/Konan-$VER-windows-$ARCH-$HASH.zip" bin )
+          done
+          # Android: APK
+          for ABI in arm64-v8a armeabi-v7a; do
+            APK=$(ls android/$ABI/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+            if [ -z "$APK" ]; then
+              # 备用路径: androiddeployqt 直接放在 release 子目录
+              APK=$(ls android/$ABI/*.apk 2>/dev/null | head -1)
+            fi
+            if [ -z "$APK" ]; then echo "找不到 android/$ABI APK"; exit 1; fi
+            cp "$APK" "$DIST/Konan-$VER-android-$ABI-$HASH.apk"
+          done
+          # iOS: 源码 tarball (用户用自己的 Apple ID 在 Xcode 重签)
+          # ../ios 是 lgpl_dist/ios/<arch>/ 的父级 = lgpl_dist/ios; 但 relink/ios 才是
+          # relink 产物。取 relink 产物 + 源 staging 一起打:用户拿到后直接 open xcodeproj。
+          tar -czf "$DIST/Konan-$VER-ios-source-$HASH.tar.gz" -C "$KONAN_SOURCE/lgpl_dist" ios
+
+      - name: 生成 SHA256 sidecar + SHA256SUMS
+        run: python3 "$KONAN_SOURCE/scripts/release_sha256.py" "$ASSETS_DIR"
+
+      - name: 创建 GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.version.outputs.tag }}"
+          # 同 tag 已存在就先删 (tag + release 都清掉, 让重发干净)
+          if gh release view "$TAG" --repo summitless/konan >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo summitless/konan --yes --cleanup-tag
+          fi
+          # target_commitish=lgpl: release 关联到 lgpl 分支顶部 commit
+          gh release create "$TAG" \
+            --repo summitless/konan \
+            --target lgpl \
+            --title "Konan $TAG" \
+            --notes "Konan $TAG. 详细安装/relink 说明见 [lgpl 分支 README](https://github.com/summitless/konan/tree/lgpl#readme)。每个 asset 旁有 \`<asset>.sha256\` sidecar, 也有总 \`SHA256SUMS\`。" \
+            "$ASSETS_DIR"/*
+
+      - name: Summary
+        run: |
+          echo "=== Assets ==="
+          ls -lh "$ASSETS_DIR"
+          echo ""
+          echo "=== SHA256SUMS ==="
+          cat "$ASSETS_DIR/SHA256SUMS"

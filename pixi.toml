@@ -1,0 +1,23 @@
+[workspace]
+name = "konan-lgpl"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
+
+[dependencies]
+python = ">=3.11"
+
+# patchelf >= 0.18 (用 --page-size 16384) 只在 mac 由 pixi 装 — conda-forge
+# linux-64 卡 0.17.2 没这个 flag, win-64 没构建, pypi 的 0.18.0 又被 yanked.
+# Linux 用户跑 android relink 需要自己装 patchelf 0.18+ (Ubuntu 24.04+
+# `apt install patchelf` 直接给 0.18.x; 其它发行版从 github 源码 build),
+# 装好放 PATH 里 relink.py 会找到. Windows 用户做 windows relink 用不到
+# patchelf.
+[target.osx-arm64.dependencies]
+patchelf = ">=0.18"
+
+[target.osx-64.dependencies]
+patchelf = ">=0.18"
+
+[tasks]
+relink = { cmd = "python relink.py", description = "用你自己的 Qt 把二进制重组成可运行/可分发包. 用法: pixi run relink <platform> --arch <arch> --qt-dir <Qt路径>" }
