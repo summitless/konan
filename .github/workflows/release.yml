@@ -172,6 +172,16 @@ jobs:
           # 带 .git/ 让 win11 端也能跑 git 命令(submodule 状态 / hash 注入)。
           python3 scripts/sync.py "${WIN11_SSH}:~/source/repos/qt6-solution/" --gitignore --git
 
+          # hbbrsync 是 sibling 目录, 通过 FetchContent SOURCE_DIR=../hbbrsync
+          # 拉进 qt6-solution 的 build。sync.py 只覆盖 qt6-solution 这一棵树,
+          # win11 上的 ../hbbrsync 不会跟 mac 同步; 直接 rsync 一份过去, 不
+          # 然客户端代码改了 + hbbrsync 新加的 API (e.g. peer_address) win11
+          # 编不过。
+          rsync -av --partial \
+            --exclude='build/' --exclude='.pixi/' --exclude='.cache/' \
+            --exclude='.DS_Store' \
+            "$KONAN_SOURCE/../hbbrsync/" "${WIN11_SSH}:~/source/repos/hbbrsync/"
+
       - name: 在 Win11 上构建 Windows (x86_64 + arm64)
         if: steps.cache_check.outputs.skip_build != 'true'
         run: |
