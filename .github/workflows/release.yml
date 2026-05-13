@@ -34,6 +34,10 @@ on:
         description: "只构建+打包, 跳过 gh release create"
         type: boolean
         default: false
+      force_rebuild:
+        description: "强制重 build/relink (忽略 lgpl_dist/relink/.built-from-hash 缓存)"
+        type: boolean
+        default: false
 
 # GITHUB_TOKEN 默认 read-only (org default), 需要显式给 contents:write 才能
 # 删/建 release; releases:write 是新写法,部分场景 contents:write 不够。
@@ -118,10 +122,16 @@ jobs:
           echo "src_hash=$SRC_HASH" >> "$GITHUB_OUTPUT"
 
           MARKER="lgpl_dist/relink/.built-from-hash"
-          # 只有 marker 命中 (跟 SRC_HASH 一致), 且 4 个平台 relink 输出
+          # force_rebuild=true 旁路所有 cache 判断 —— 用在"上次 release 二进制
+          # 串味, 想原地重发同一个版本"的场景 (CI/sync 改动不会变 src_hash,
+          # 没这个旁路就只能改个无关源码骗 cache 失效)。
+          # 否则:只有 marker 命中 (跟 SRC_HASH 一致), 且 4 个平台 relink 输出
           # 都齐, 才跳过 build/relink。缺一个 (e.g. windows 上次失败) 就
           # 重做整套。
-          if [ -f "$MARKER" ] && [ "$(cat $MARKER)" = "$SRC_HASH" ] \
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            echo "skip_build=false" >> "$GITHUB_OUTPUT"
+            echo "force_rebuild=true → 跳过 cache, 走完整 build → relink (HEAD=$HEAD_HASH, src=$SRC_HASH)"
+          elif [ -f "$MARKER" ] && [ "$(cat $MARKER)" = "$SRC_HASH" ] \
              && [ -d lgpl_dist/relink/macos ]   && [ -d lgpl_dist/relink/ios ] \
              && [ -d lgpl_dist/relink/android ] && [ -d lgpl_dist/relink/windows ]; then
             echo "skip_build=true" >> "$GITHUB_OUTPUT"
@@ -171,6 +181,16 @@ jobs:
           # 一次性 push, 不 watch。--gitignore 跳过 build/ .pixi/ 等; --git
           # 带 .git/ 让 win11 端也能跑 git 命令(submodule 状态 / hash 注入)。
           python3 scripts/sync.py "${WIN11_SSH}:~/source/repos/qt6-solution/" --gitignore --git
+
+          # hbbrsync 是 sibling 目录, 通过 FetchContent SOURCE_DIR=../hbbrsync
+          # 拉进 qt6-solution 的 build。sync.py 只覆盖 qt6-solution 这一棵树,
+          # win11 上的 ../hbbrsync 不会跟 mac 同步; 直接 rsync 一份过去, 不
+          # 然客户端代码改了 + hbbrsync 新加的 API (e.g. peer_address) win11
+          # 编不过。
+          rsync -av --partial \
+            --exclude='build/' --exclude='.pixi/' --exclude='.cache/' \
+            --exclude='.DS_Store' \
+            "$KONAN_SOURCE/../hbbrsync/" "${WIN11_SSH}:~/source/repos/hbbrsync/"
 
       - name: 在 Win11 上构建 Windows (x86_64 + arm64)
         if: steps.cache_check.outputs.skip_build != 'true'
@@ -289,6 +309,15 @@ jobs:
           # 先把 lgpl_dist (含刚生成的 windows/<arch>) sync 到 win11 让它有最新 staging
           cd "$KONAN_SOURCE"
           python3 scripts/sync.py "${WIN11_SSH}:~/source/repos/qt6-solution/" --gitignore --git
+          # sync.py 用 --gitignore 过滤, 而 .gitignore 把 /lgpl_dist/windows/
+          # 整个排除 (它是 lgpl 分支 staging, 不该 commit 进 Private)。但
+          # win11 上的 relink windows 恰好就要读这个目录里刚 stage 进去的
+          # Konan.exe。第一次 release 时 win11 没这目录, relink 直接报错;
+          # 之后每次 release, win11 一直用上一次留下的旧 .exe → 出现过
+          # v1.1.1 包里装 v1.0.1 binary 的事故。这里单独再推一遍, 绕开 .gitignore。
+          rsync -av --delete \
+            "$KONAN_SOURCE/lgpl_dist/windows/" \
+            "${WIN11_SSH}:~/source/repos/qt6-solution/lgpl_dist/windows/"
           ssh "$WIN11_SSH" "cd ~/source/repos/qt6-solution/lgpl_dist && \
             pixi run relink windows --arch x86_64 --qt-dir '$QT_DIR_WIN' && \
             pixi run relink windows --arch arm64  --qt-dir '$QT_DIR_WIN'"

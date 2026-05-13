@@ -5,7 +5,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import HotReloadPlugin 1.0
-import HbbControls
+import AntControls
 
 import QtQuick
 Item {}

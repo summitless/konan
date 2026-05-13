@@ -7,7 +7,7 @@
   "plugins": [
     {"library": "hotreload_plugin"},
     {"library": "dashboard_plugin"},
-    {"library": "qml_controls_plugin"},
+    {"library": "ant_controls_plugin"},
     {"library": "ffi_example_plugin", "loader": "ffi"}
   ]
 }

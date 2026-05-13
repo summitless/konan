@@ -37,12 +37,12 @@
   "qml-import-paths": "/Users/hbb/source/repos/qt6-solution/build/android-armeabi-v7a-release/src/app",
   "qml-root-path": [
     "/Users/hbb/source/repos/qt6-solution/src/app",
+    "/Users/hbb/source/repos/qt6-solution/src/plugins/ant_controls/src/qml/common",
+    "/Users/hbb/source/repos/qt6-solution/src/plugins/ant_controls/src/qml",
+    "/Users/hbb/source/repos/qt6-solution/src/plugins/ant_controls/src/qml/gallery",
+    "/Users/hbb/source/repos/qt6-solution/src/plugins/ant_controls/src/qml/gallery/pages",
     "/Users/hbb/source/repos/qt6-solution/src/plugins/plugin/src/qml",
-    "/Users/hbb/source/repos/qt6-solution/src/plugins/plugin2/src/qml",
-    "/Users/hbb/source/repos/qt6-solution/src/plugins/qml_controls/src/qml/common",
-    "/Users/hbb/source/repos/qt6-solution/src/plugins/qml_controls/src/qml",
-    "/Users/hbb/source/repos/qt6-solution/src/plugins/qml_controls/src/qml/gallery",
-    "/Users/hbb/source/repos/qt6-solution/src/plugins/qml_controls/src/qml/gallery/pages"
+    "/Users/hbb/source/repos/qt6-solution/src/plugins/plugin2/src/qml"
   ],
   "qml-importscanner-binary": "/Users/hbb/Qt/6.8.3/macos/libexec/qmlimportscanner",
   "qml-dom-binary": "/Users/hbb/Qt/6.8.3/macos/bin/qmldom",
